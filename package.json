@@ -1,0 +1,27 @@
+{
+  "name": "tj-boardroom",
+  "private": true,
+  "version": "0.5.0",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "test": "wrangler deploy --dry-run --outdir dist && cp dist/index.js dist/worker.js && node --test --test-concurrency=1 oauth.test.mjs memory.test.mjs regression.test.mjs adversarial.test.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4"
+  },
+  "devDependencies": {
+    "wrangler": "^4",
+    "miniflare": "4.20260730.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "OPENAI_API_KEY": {
+        "description": "Your OpenAI API key from platform.openai.com (keep auto-reload OFF). Stored only in Cloudflare."
+      },
+      "OWNER_PIN": {
+        "description": "Make up a PIN, 10+ characters. You type it once when Claude connects."
+      }
+    }
+  }
+}

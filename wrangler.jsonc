@@ -1,0 +1,10 @@
+{
+  "name": "tj-boardroom",
+  "main": "index.mjs",
+  "compatibility_date": "2025-09-01",
+  "workers_dev": true,
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "durable_objects": { "bindings": [{ "name": "BOARDROOM", "class_name": "Boardroom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Boardroom"] }],
+  "vars": { "CAP_USD": "4" }
+}
