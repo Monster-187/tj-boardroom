@@ -164,8 +164,7 @@ const LoginHandler = {
       if (!check.ok) return page(check.locked ? 429 : 401, 'Wrong PIN', check.locked ? '<p>Too many wrong PINs. Try again in 30 minutes.</p>' : '<p>Wrong PIN. Go back and try again.</p>');
       const pending = await openConsent(env, handle);
       if (!pending.request) return page(400, 'Invalid request', '<p>Sign-in expired (' + esc(pending.why || 'unknown') + '). Start again from Claude.</p>');
-      const used = await (await boardroom(env).fetch('https://do/consent-used', { method: 'POST', body: JSON.stringify({ id: handle.split('.')[1] }) })).json().catch(() => ({ first: true }));
-      if (used.first === false) return page(400, 'Invalid request', '<p>This sign-in was already used. Start again from Claude.</p>');
+      // v0.5.3: no server-side 'used' mark (Cloudflare ran it twice per click). PIN is still required; auth codes stay single-use.
       let redirectTo;
       try {
         ({ redirectTo } = await oauth.completeAuthorization({
@@ -397,7 +396,7 @@ export class Boardroom {
     let msg; try { msg = JSON.parse(await req.text()); } catch { return json(400, { error: 'bad json' }); }
     if (!msg || typeof msg !== 'object') return json(400, { error: 'bad json' });
     const reply = (result) => json(200, { jsonrpc: '2.0', id: msg.id ?? null, result });
-    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5.2-cf' }, capabilities: { tools: {} } });
+    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5.3-cf' }, capabilities: { tools: {} } });
     if (msg.method === 'notifications/initialized') return new Response(null, { status: 202 });
     if (msg.method === 'tools/list') return reply({ tools: TOOLS });
     if (msg.method === 'tools/call') {
