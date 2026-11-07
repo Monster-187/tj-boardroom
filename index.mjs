@@ -118,34 +118,37 @@ const LoginHandler = {
       try { request = await oauth.parseAuthRequest(req); } catch { return page(400, 'Invalid request', '<p>Invalid sign-in request.</p>'); }
       const details = await oauth.describeConsent(request);
       if (!ALLOWED_REDIRECT_HOSTS.has(details.redirectHost)) return page(400, 'Refused', '<p>Only Claude may connect to this Boardroom.</p>');
-      const consent = await oauth.beginConsent(request);
+      // v0.5.1: keep the pending sign-in in the Durable Object (strongly consistent), not a KV+cookie pair.
+      const handle = [...crypto.getRandomValues(new Uint8Array(24))].map(b => b.toString(16).padStart(2, '0')).join('');
+      await boardroom(env).fetch('https://do/consent-put', { method: 'POST', body: JSON.stringify({ handle, request }) });
+      const h = new Headers({ 'cache-control': 'no-store' });
       return page(200, 'Tj AI Boardroom', `
         <h2>Connect ${esc(details.clientName || 'app')} to Tj's AI Boardroom?</h2>
         <p>Access goes to <strong>${esc(details.redirectHost)}</strong>. It lets Claude ask ChatGPT and save decisions, within the spending cap.</p>
         <form method="post">
-          <input type="hidden" name="handle" value="${esc(consent.handle)}">
+          <input type="hidden" name="handle" value="${esc(handle)}">
           <p><label>PIN<br><input name="pin" type="password" autocomplete="current-password" required style="font-size:18px;width:100%"></label></p>
           <p><button name="decision" value="approve" style="font-size:18px">Allow</button>
-             <button name="decision" value="deny" style="font-size:18px">Deny</button></p>
-        </form>`, consent.headers);
+             <button name="decision" value="deny" formnovalidate style="font-size:18px">Deny</button></p>
+        </form>`, h);
     }
 
     if (req.method === 'POST') {
       const form = await req.formData();
       const handle = String(form.get('handle') ?? '');
-      if (form.get('decision') !== 'approve') {
-        try { const denied = await oauth.denyConsent(req, handle); return new Response(null, { status: 302, headers: denied.headers }); }
-        catch { return page(400, 'Invalid request', '<p>Invalid request.</p>'); }
-      }
+      const take = async () => (await (await boardroom(env).fetch('https://do/consent-take', { method: 'POST', body: JSON.stringify({ handle }) })).json());
+      if (form.get('decision') !== 'approve') { await take(); return page(200, 'Cancelled', '<p>Cancelled. You can close this tab.</p>'); }
       const check = await (await boardroom(env).fetch('https://do/pin-check', { method: 'POST', body: JSON.stringify({ pin: String(form.get('pin') ?? '') }) })).json();
       if (!check.ok) return page(check.locked ? 429 : 401, 'Wrong PIN', check.locked ? '<p>Too many wrong PINs. Try again in 30 minutes.</p>' : '<p>Wrong PIN. Go back and try again.</p>');
-      let approved;
-      try { approved = await oauth.approveConsent(req, handle, { scope: ['mcp'] }); } catch { return page(400, 'Invalid request', '<p>Sign-in expired. Start again from Claude.</p>'); }
-      const { redirectTo } = await oauth.completeAuthorization({
-        request: approved.request, userId: 'tj', metadata: {}, scope: ['mcp'], props: { userId: 'tj' },
-      });
-      approved.headers.set('Location', redirectTo);
-      return new Response(null, { status: 302, headers: approved.headers });
+      const pending = await take();
+      if (!pending.request) return page(400, 'Invalid request', '<p>Sign-in expired (' + esc(pending.why || 'unknown') + '). Start again from Claude.</p>');
+      let redirectTo;
+      try {
+        ({ redirectTo } = await oauth.completeAuthorization({
+          request: pending.request, userId: 'tj', metadata: {}, scope: ['mcp'], props: { userId: 'tj' },
+        }));
+      } catch (e) { return page(400, 'Invalid request', '<p>Could not finish sign-in: ' + esc(String(e && e.message || e).slice(0, 200)) + '. Start again from Claude.</p>'); }
+      return new Response(null, { status: 302, headers: { Location: redirectTo, 'cache-control': 'no-store' } });
     }
     return page(405, 'Not allowed', '<p>Method not allowed.</p>');
   },
@@ -175,6 +178,7 @@ const NEW_LEDGER = () => ({ spentMicro: 0, reservedMicro: 0, calls: 0, consecuti
   pinFails: 0, pinLockedUntil: 0, exchanges: 0, threadStart: '', identityVersion: 0,
   breaker: { open: false, reason: null, at: null } });
 
+const CONSENT_TTL_MS = 15 * 60 * 1000;
 export class Boardroom {
   constructor(ctx, env) {
     this.ctx = ctx; this.env = env;
@@ -351,6 +355,27 @@ export class Boardroom {
   async fetch(req) {
     if (this.configError) return json(503, { error: 'server not configured' });
     const path = new URL(req.url).pathname;
+    if (path === '/consent-put') {
+      let m = {}; try { m = await req.json(); } catch {}
+      if (typeof m.handle !== 'string' || m.handle.length < 32 || !m.request) return json(400, { error: 'bad' });
+      // drop old pending sign-ins so storage can't grow
+      const old = await this.ctx.storage.list({ prefix: 'consent:' });
+      const cutoff = Date.now() - CONSENT_TTL_MS;
+      for (const [k, v] of old) if (!v || v.at < cutoff) await this.ctx.storage.delete(k);
+      if (old.size > 20) return json(429, { error: 'too many pending' });
+      await this.ctx.storage.put('consent:' + m.handle, { request: m.request, at: Date.now() });
+      return json(200, { ok: true });
+    }
+    if (path === '/consent-take') {
+      let m = {}; try { m = await req.json(); } catch {}
+      if (typeof m.handle !== 'string' || m.handle.length < 32) return json(200, { why: 'no handle' });
+      const key = 'consent:' + m.handle;
+      const v = await this.ctx.storage.get(key);
+      if (!v) return json(200, { why: 'not found or already used' });
+      await this.ctx.storage.delete(key);
+      if (Date.now() - v.at > CONSENT_TTL_MS) return json(200, { why: 'older than 15 minutes' });
+      return json(200, { request: v.request });
+    }
     if (path === '/pin-check') {
       let pin = ''; try { pin = (await req.json()).pin; } catch {}
       return json(200, await this.pinCheck(pin));
@@ -358,7 +383,7 @@ export class Boardroom {
     let msg; try { msg = JSON.parse(await req.text()); } catch { return json(400, { error: 'bad json' }); }
     if (!msg || typeof msg !== 'object') return json(400, { error: 'bad json' });
     const reply = (result) => json(200, { jsonrpc: '2.0', id: msg.id ?? null, result });
-    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5-cf-test' }, capabilities: { tools: {} } });
+    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5.1-cf' }, capabilities: { tools: {} } });
     if (msg.method === 'notifications/initialized') return new Response(null, { status: 202 });
     if (msg.method === 'tools/list') return reply({ tools: TOOLS });
     if (msg.method === 'tools/call') {
