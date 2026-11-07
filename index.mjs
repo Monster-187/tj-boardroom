@@ -105,6 +105,30 @@ const McpApiHandler = {
   },
 };
 
+
+// ---------- v0.5.2 sealed consent (no server storage) ----------
+const b64u = (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)), c => c.charCodeAt(0));
+async function consentKey(env) {
+  const raw = await crypto.subtle.digest('SHA-256', enc.encode('tj-boardroom-consent-v1|' + env.OWNER_PIN + '|' + env.OPENAI_API_KEY));
+  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+async function sealConsent(env, request) {
+  const body = b64u(enc.encode(JSON.stringify({ r: request, t: Date.now() })));
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', await consentKey(env), enc.encode(body)));
+  return body + '.' + b64u(sig);
+}
+async function openConsent(env, token) {
+  const [body, sig] = String(token || '').split('.');
+  if (!body || !sig || token.length > 20000) return { why: 'missing' };
+  let ok = false;
+  try { ok = await crypto.subtle.verify('HMAC', await consentKey(env), unb64u(sig), enc.encode(body)); } catch {}
+  if (!ok) return { why: 'bad signature' };
+  let m; try { m = JSON.parse(new TextDecoder().decode(unb64u(body))); } catch { return { why: 'unreadable' }; }
+  if (!m || typeof m.t !== 'number' || Date.now() - m.t > 15 * 60 * 1000 || m.t > Date.now() + 60000) return { why: 'older than 15 minutes' };
+  return { request: m.r };
+}
+
 // ---------- Login page: Tj types his PIN to let Claude in ----------
 const LoginHandler = {
   async fetch(req, env) {
@@ -118,9 +142,8 @@ const LoginHandler = {
       try { request = await oauth.parseAuthRequest(req); } catch { return page(400, 'Invalid request', '<p>Invalid sign-in request.</p>'); }
       const details = await oauth.describeConsent(request);
       if (!ALLOWED_REDIRECT_HOSTS.has(details.redirectHost)) return page(400, 'Refused', '<p>Only Claude may connect to this Boardroom.</p>');
-      // v0.5.1: keep the pending sign-in in the Durable Object (strongly consistent), not a KV+cookie pair.
-      const handle = [...crypto.getRandomValues(new Uint8Array(24))].map(b => b.toString(16).padStart(2, '0')).join('');
-      await boardroom(env).fetch('https://do/consent-put', { method: 'POST', body: JSON.stringify({ handle, request }) });
+      // v0.5.2: the pending sign-in is sealed (HMAC-signed, 15 min) into the form itself, so nothing can get lost.
+      const handle = await sealConsent(env, request);
       const h = new Headers({ 'cache-control': 'no-store' });
       return page(200, 'Tj AI Boardroom', `
         <h2>Connect ${esc(details.clientName || 'app')} to Tj's AI Boardroom?</h2>
@@ -136,12 +159,13 @@ const LoginHandler = {
     if (req.method === 'POST') {
       const form = await req.formData();
       const handle = String(form.get('handle') ?? '');
-      const take = async () => (await (await boardroom(env).fetch('https://do/consent-take', { method: 'POST', body: JSON.stringify({ handle }) })).json());
-      if (form.get('decision') !== 'approve') { await take(); return page(200, 'Cancelled', '<p>Cancelled. You can close this tab.</p>'); }
+      if (form.get('decision') !== 'approve') return page(200, 'Cancelled', '<p>Cancelled. You can close this tab.</p>');
       const check = await (await boardroom(env).fetch('https://do/pin-check', { method: 'POST', body: JSON.stringify({ pin: String(form.get('pin') ?? '') }) })).json();
       if (!check.ok) return page(check.locked ? 429 : 401, 'Wrong PIN', check.locked ? '<p>Too many wrong PINs. Try again in 30 minutes.</p>' : '<p>Wrong PIN. Go back and try again.</p>');
-      const pending = await take();
+      const pending = await openConsent(env, handle);
       if (!pending.request) return page(400, 'Invalid request', '<p>Sign-in expired (' + esc(pending.why || 'unknown') + '). Start again from Claude.</p>');
+      const used = await (await boardroom(env).fetch('https://do/consent-used', { method: 'POST', body: JSON.stringify({ id: handle.split('.')[1] }) })).json().catch(() => ({ first: true }));
+      if (used.first === false) return page(400, 'Invalid request', '<p>This sign-in was already used. Start again from Claude.</p>');
       let redirectTo;
       try {
         ({ redirectTo } = await oauth.completeAuthorization({
@@ -355,26 +379,16 @@ export class Boardroom {
   async fetch(req) {
     if (this.configError) return json(503, { error: 'server not configured' });
     const path = new URL(req.url).pathname;
-    if (path === '/consent-put') {
+    if (path === '/consent-used') {
       let m = {}; try { m = await req.json(); } catch {}
-      if (typeof m.handle !== 'string' || m.handle.length < 32 || !m.request) return json(400, { error: 'bad' });
-      // drop old pending sign-ins so storage can't grow
-      const old = await this.ctx.storage.list({ prefix: 'consent:' });
+      if (typeof m.id !== 'string' || m.id.length < 20) return json(200, { first: false });
+      const key = 'cused:' + m.id.slice(0, 64);
+      if (await this.ctx.storage.get(key)) return json(200, { first: false });
+      const old = await this.ctx.storage.list({ prefix: 'cused:' });
       const cutoff = Date.now() - CONSENT_TTL_MS;
-      for (const [k, v] of old) if (!v || v.at < cutoff) await this.ctx.storage.delete(k);
-      if (old.size > 20) return json(429, { error: 'too many pending' });
-      await this.ctx.storage.put('consent:' + m.handle, { request: m.request, at: Date.now() });
-      return json(200, { ok: true });
-    }
-    if (path === '/consent-take') {
-      let m = {}; try { m = await req.json(); } catch {}
-      if (typeof m.handle !== 'string' || m.handle.length < 32) return json(200, { why: 'no handle' });
-      const key = 'consent:' + m.handle;
-      const v = await this.ctx.storage.get(key);
-      if (!v) return json(200, { why: 'not found or already used' });
-      await this.ctx.storage.delete(key);
-      if (Date.now() - v.at > CONSENT_TTL_MS) return json(200, { why: 'older than 15 minutes' });
-      return json(200, { request: v.request });
+      for (const [k, v] of old) if (!v || v < cutoff) await this.ctx.storage.delete(k);
+      await this.ctx.storage.put(key, Date.now());
+      return json(200, { first: true });
     }
     if (path === '/pin-check') {
       let pin = ''; try { pin = (await req.json()).pin; } catch {}
@@ -383,7 +397,7 @@ export class Boardroom {
     let msg; try { msg = JSON.parse(await req.text()); } catch { return json(400, { error: 'bad json' }); }
     if (!msg || typeof msg !== 'object') return json(400, { error: 'bad json' });
     const reply = (result) => json(200, { jsonrpc: '2.0', id: msg.id ?? null, result });
-    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5.1-cf' }, capabilities: { tools: {} } });
+    if (msg.method === 'initialize') return reply({ protocolVersion: '2025-06-18', serverInfo: { name: 'tj-boardroom', version: '0.5.2-cf' }, capabilities: { tools: {} } });
     if (msg.method === 'notifications/initialized') return new Response(null, { status: 202 });
     if (msg.method === 'tools/list') return reply({ tools: TOOLS });
     if (msg.method === 'tools/call') {
